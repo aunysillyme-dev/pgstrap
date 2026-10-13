@@ -8,16 +8,33 @@ import { dumpTree } from "pg-schema-dump"
 import path from "path"
 import { migrate } from "./migrate"
 
-export const generate = async ({
+type GenerateOptions = Pick<
+  Context,
+  "schemas" | "defaultDatabase" | "dbDir"
+> & {
+  pglite?: boolean
+  migrationsDir?: string
+}
+
+let pendingGeneration: Promise<void> = Promise.resolve()
+
+export const generate = (options: GenerateOptions) => {
+  // dumpTree reads DATABASE_URL, so embedded and external runs must not overlap.
+  const result = pendingGeneration.then(() => generateOnce(options))
+  pendingGeneration = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  return result
+}
+
+const generateOnce = async ({
   schemas,
   defaultDatabase,
   dbDir,
-  pglite = false,
+  pglite = true,
   migrationsDir,
-}: Pick<Context, "schemas" | "defaultDatabase" | "dbDir"> & {
-  pglite?: boolean
-  migrationsDir?: string
-}) => {
+}: GenerateOptions) => {
   dbDir = dbDir ?? "./src/db"
   migrationsDir = migrationsDir ?? path.join(dbDir, "migrations")
 
@@ -28,16 +45,11 @@ export const generate = async ({
 
     const db = new PGlite()
 
-    await migrate({
-      client: db as any,
-      migrationsDir,
-      defaultDatabase,
-      cwd: process.cwd(),
-      schemas,
-    })
-
-    const server = net.createServer(async (socket) => {
-      const connection = await fromNodeSocket(socket, {
+    const sockets = new Set<import("node:net").Socket>()
+    const server = net.createServer((socket) => {
+      sockets.add(socket)
+      socket.once("close", () => sockets.delete(socket))
+      void fromNodeSocket(socket, {
         serverVersion: "16.3 (PGlite)",
         auth: {
           method: "password",
@@ -57,35 +69,56 @@ export const generate = async ({
             return undefined
           }
         },
-      })
+      }).catch(() => socket.destroy())
     })
-
-    await new Promise<void>((resolve) => server.listen(0, resolve))
-    const port = (server.address() as any).port
-    const connectionString = `postgres://postgres:postgres@127.0.0.1:${port}/postgres`
-
     const prevDbUrl = process.env.DATABASE_URL
-    process.env.DATABASE_URL = connectionString
+    try {
+      await migrate({
+        client: db as any,
+        migrationsDir,
+        defaultDatabase,
+        cwd: process.cwd(),
+        schemas,
+      })
 
-    await zg.generate({
-      db: {
-        connectionString,
-      },
-      schemas: Object.fromEntries(
-        schemas.map((s) => [s, { include: "*", exclude: [] }]),
-      ),
-      outDir: dbDir,
-    })
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject)
+        server.listen(0, "127.0.0.1", () => {
+          server.removeListener("error", reject)
+          resolve()
+        })
+      })
+      const port = (server.address() as import("node:net").AddressInfo).port
+      const connectionString = `postgres://postgres:postgres@127.0.0.1:${port}/postgres`
+      process.env.DATABASE_URL = connectionString
 
-    await dumpTree({
-      targetDir: path.join(dbDir, "structure"),
-      defaultDatabase: "postgres",
-      schemas,
-    })
+      await zg.generate({
+        db: { connectionString },
+        schemas: Object.fromEntries(
+          schemas.map((s) => [s, { include: "*", exclude: [] }]),
+        ),
+        outDir: dbDir,
+      })
 
-    server.close()
-    if (prevDbUrl === undefined) delete process.env.DATABASE_URL
-    else process.env.DATABASE_URL = prevDbUrl
+      await dumpTree({
+        targetDir: path.join(dbDir, "structure"),
+        defaultDatabase: "postgres",
+        schemas,
+      })
+    } finally {
+      if (prevDbUrl === undefined) delete process.env.DATABASE_URL
+      else process.env.DATABASE_URL = prevDbUrl
+      for (const socket of sockets) socket.destroy()
+      try {
+        if (server.listening) {
+          await new Promise<void>((resolve, reject) => {
+            server.close((error) => (error ? reject(error) : resolve()))
+          })
+        }
+      } finally {
+        await db.close()
+      }
+    }
     return
   }
 
