@@ -17,9 +17,15 @@ type GenerateOptions = Pick<
 }
 
 let pendingGeneration: Promise<void> = Promise.resolve()
+const databaseUriKeys = [
+  "POSTGRES_URI",
+  "PG_URI",
+  "DATABASE_URL",
+  "DATABASE_URI",
+] as const
 
 export const generate = (options: GenerateOptions) => {
-  // dumpTree reads DATABASE_URL, so embedded and external runs must not overlap.
+  // dumpTree reads process-wide URI aliases, so generation must not overlap.
   const result = pendingGeneration.then(() => generateOnce(options))
   pendingGeneration = result.then(
     () => undefined,
@@ -71,7 +77,7 @@ const generateOnce = async ({
         },
       }).catch(() => socket.destroy())
     })
-    const prevDbUrl = process.env.DATABASE_URL
+    const previousUris = databaseUriKeys.map((key) => process.env[key])
     try {
       await migrate({
         client: db as any,
@@ -90,7 +96,7 @@ const generateOnce = async ({
       })
       const port = (server.address() as import("node:net").AddressInfo).port
       const connectionString = `postgres://postgres:postgres@127.0.0.1:${port}/postgres`
-      process.env.DATABASE_URL = connectionString
+      for (const key of databaseUriKeys) process.env[key] = connectionString
 
       await zg.generate({
         db: { connectionString },
@@ -106,8 +112,11 @@ const generateOnce = async ({
         schemas,
       })
     } finally {
-      if (prevDbUrl === undefined) delete process.env.DATABASE_URL
-      else process.env.DATABASE_URL = prevDbUrl
+      databaseUriKeys.forEach((key, index) => {
+        const previous = previousUris[index]
+        if (previous === undefined) delete process.env[key]
+        else process.env[key] = previous
+      })
       for (const socket of sockets) socket.destroy()
       try {
         if (server.listening) {

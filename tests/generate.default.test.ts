@@ -8,6 +8,12 @@ import { generate } from "../src/generate"
 const unavailableDatabase =
   "postgres://postgres:postgres@127.0.0.1:1/unavailable"
 const cli = path.resolve(__dirname, "../src/cli.ts")
+const databaseUriKeys = [
+  "POSTGRES_URI",
+  "PG_URI",
+  "DATABASE_URL",
+  "DATABASE_URI",
+] as const
 
 function fixture(migration = 'pgm.createTable("widgets", { id: "id" })') {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pgstrap-default-"))
@@ -46,7 +52,12 @@ function expectArtifacts(dbDir: string) {
 async function runCli(cwd: string, ...args: string[]) {
   const child = Bun.spawn([process.execPath, cli, "generate", ...args], {
     cwd,
-    env: { ...process.env, DATABASE_URL: unavailableDatabase },
+    env: {
+      ...process.env,
+      ...Object.fromEntries(
+        databaseUriKeys.map((key) => [key, unavailableDatabase]),
+      ),
+    },
     stdout: "pipe",
     stderr: "pipe",
   })
@@ -63,20 +74,24 @@ async function runCli(cwd: string, ...args: string[]) {
   }
 }
 
-test("generate defaults to PGlite and restores DATABASE_URL", async () => {
+test("generate defaults to PGlite and restores every database URI alias", async () => {
   const ctx = fixture()
-  const previous = process.env.DATABASE_URL
-  process.env.DATABASE_URL = unavailableDatabase
+  const previousUris = databaseUriKeys.map((key) => process.env[key])
+  for (const key of databaseUriKeys) process.env[key] = unavailableDatabase
   const close = spyOn(PGlite.prototype, "close")
   try {
     await generate(ctx)
     expectArtifacts(ctx.dbDir)
-    expect(process.env.DATABASE_URL).toBe(unavailableDatabase)
+    for (const key of databaseUriKeys)
+      expect(process.env[key]).toBe(unavailableDatabase)
     expect(close).toHaveBeenCalledTimes(1)
   } finally {
     close.mockRestore()
-    if (previous === undefined) delete process.env.DATABASE_URL
-    else process.env.DATABASE_URL = previous
+    databaseUriKeys.forEach((key, index) => {
+      const previous = previousUris[index]
+      if (previous === undefined) delete process.env[key]
+      else process.env[key] = previous
+    })
     fs.rmSync(ctx.cwd, { recursive: true, force: true })
   }
 })
